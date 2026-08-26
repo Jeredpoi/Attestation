@@ -187,10 +187,80 @@
     editingId: null,
     newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
   };
-  // jsonblob.com перестал отдавать Access-Control-Allow-Origin, из-за чего
-  // браузер блокировал запросы ещё до отправки — переехали на kvdb.io
-  const STORE_BASE = "https://kvdb.io";
+  // ни один бесплатный сервис-хранилище не бывает надёжным сам по себе
+  // (jsonblob перестал слать CORS-заголовки, kvdb.io периодически падает
+  // с 500), поэтому пробуем несколько провайдеров по очереди — первый,
+  // кто ответил, и становится хранилищем
   const REQUEST_TIMEOUT = 8000;
+
+  const PROVIDERS = [
+    {
+      name: "kvdb",
+      async create(seed) {
+        const createRes = await fetchWithTimeout("https://kvdb.io/", { method: "POST" });
+        const bucket = (await createRes.text()).trim();
+        if (!createRes.ok || !bucket) throw new Error("kvdb: bucket не создан");
+        const seedRes = await fetchWithTimeout("https://kvdb.io/" + bucket + "/data", {
+          method: "POST", body: JSON.stringify(seed),
+        });
+        if (!seedRes.ok) throw new Error("kvdb: не записались начальные данные");
+        return bucket;
+      },
+      async read(id) {
+        const res = await fetchWithTimeout("https://kvdb.io/" + id + "/data");
+        if (!res.ok) throw new Error("kvdb: чтение не удалось");
+        const text = await res.text();
+        return text ? JSON.parse(text) : {};
+      },
+      async write(id, data) {
+        const res = await fetchWithTimeout("https://kvdb.io/" + id + "/data", {
+          method: "POST", body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error("kvdb: запись не удалась");
+      },
+    },
+    {
+      name: "extendsclass",
+      async create(seed) {
+        const res = await fetchWithTimeout("https://extendsclass.com/api/json-storage/bin", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(seed),
+        });
+        if (!res.ok) throw new Error("extendsclass: bucket не создан");
+        const data = await res.json();
+        if (!data.id) throw new Error("extendsclass: сервис не вернул id");
+        return data.id;
+      },
+      async read(id) {
+        const res = await fetchWithTimeout("https://extendsclass.com/api/json-storage/bin/" + id);
+        if (!res.ok) throw new Error("extendsclass: чтение не удалось");
+        return await res.json();
+      },
+      async write(id, data) {
+        const res = await fetchWithTimeout("https://extendsclass.com/api/json-storage/bin/" + id, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error("extendsclass: запись не удалась");
+      },
+    },
+  ];
+
+  function findProvider(name) {
+    const p = PROVIDERS.find(p => p.name === name);
+    if (!p) throw new Error("неизвестный провайдер хранилища: " + name);
+    return p;
+  }
+
+  // старые ссылки хранили голый id бакета kvdb без префикса — считаем их kvdb
+  function parseDbParam(raw) {
+    if (!raw) return null;
+    const idx = raw.indexOf(":");
+    if (idx === -1) return { provider: "kvdb", id: raw };
+    return { provider: raw.slice(0, idx), id: raw.slice(idx + 1) };
+  }
 
   function getParam(name) {
     return new URLSearchParams(window.location.search).get(name);
@@ -208,30 +278,32 @@
   }
 
   async function fetchSharedData() {
-    const idFromUrl = getParam("db");
-    if (idFromUrl) {
-      const res = await fetchWithTimeout(STORE_BASE + "/" + idFromUrl + "/data");
-      if (!res.ok) throw new Error("хранилище с этим id не найдено");
-      const text = await res.text();
-      const data = text ? JSON.parse(text) : {};
+    const raw = getParam("db");
+    const parsed = parseDbParam(raw);
+    if (parsed) {
+      const data = await findProvider(parsed.provider).read(parsed.id);
       return {
-        id: idFromUrl,
+        id: parsed.provider + ":" + parsed.id,
         questions: Array.isArray(data.questions) ? data.questions : [],
         attempts: Array.isArray(data.attempts) ? data.attempts : [],
       };
     }
-    const createRes = await fetchWithTimeout(STORE_BASE + "/", { method: "POST" });
-    const bucket = (await createRes.text()).trim();
-    if (!createRes.ok || !bucket) throw new Error("сервис хранилища не ответил");
 
-    const seed = JSON.stringify({ questions: DEFAULT_QUESTIONS, attempts: [] });
-    const seedRes = await fetchWithTimeout(STORE_BASE + "/" + bucket + "/data", { method: "POST", body: seed });
-    if (!seedRes.ok) throw new Error("не удалось записать начальные данные");
-    return { id: bucket, questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
+    const seed = { questions: DEFAULT_QUESTIONS, attempts: [] };
+    let lastErr;
+    for (const provider of PROVIDERS) {
+      try {
+        const id = await provider.create(seed);
+        return { id: provider.name + ":" + id, questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("ни один сервис хранилища не ответил");
   }
 
-  // сервис хранилища иногда отваливается на секунду-две, поэтому даём
-  // вторую попытку перед тем как уходить в локальный режим
+  // если выбранный провайдер недоступен, даём вторую попытку перед тем
+  // как уходить в локальный режим — за это время он мог отойти
   async function connectShared() {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
