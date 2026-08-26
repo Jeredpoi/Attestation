@@ -181,11 +181,14 @@
     attempts: null,
     blobId: null,
     storageMode: "local",
+    syncFailed: false,
+    connecting: false,
     formOpen: false,
     editingId: null,
     newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
   };
   const JSONBLOB_BASE = "https://jsonblob.com/api/jsonBlob";
+  const REQUEST_TIMEOUT = 8000;
 
   function getParam(name) {
     return new URLSearchParams(window.location.search).get(name);
@@ -196,50 +199,64 @@
     return existing.concat(missing);
   }
 
-  async function initStorage() {
+  function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+  }
+
+  async function fetchSharedData() {
     const idFromUrl = getParam("db");
     if (idFromUrl) {
-      state.blobId = idFromUrl;
+      const res = await fetchWithTimeout(JSONBLOB_BASE + "/" + idFromUrl);
+      if (!res.ok) throw new Error("хранилище с этим id не найдено");
+      const data = await res.json();
+      return {
+        id: idFromUrl,
+        questions: Array.isArray(data.questions) ? data.questions : [],
+        attempts: Array.isArray(data.attempts) ? data.attempts : [],
+      };
+    }
+    const res = await fetchWithTimeout(JSONBLOB_BASE, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ questions: DEFAULT_QUESTIONS, attempts: [] }),
+    });
+    const location = res.headers.get("Location");
+    if (!res.ok || !location) throw new Error("сервис хранилища не ответил");
+    return { id: location.split("/").pop(), questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
+  }
+
+  // jsonblob иногда отваливается на секунду-две, поэтому даём вторую попытку
+  // перед тем как уходить в локальный режим
+  async function connectShared() {
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const res = await fetch(JSONBLOB_BASE + "/" + idFromUrl);
-        if (!res.ok) throw new Error("not found");
-        const data = await res.json();
-        const loaded = Array.isArray(data.questions) ? data.questions : [];
-        state.questions = mergeDefaults(loaded);
-        state.attempts = Array.isArray(data.attempts) ? data.attempts : [];
+        const shared = await fetchSharedData();
+        state.blobId = shared.id;
+        state.questions = mergeDefaults(shared.questions);
+        state.attempts = shared.attempts;
         state.storageMode = "shared";
-        if (state.questions.length !== loaded.length) {
-          await persist();
-        }
-      } catch (e) {
-        state.storageMode = "local";
-        loadLocal();
-      }
-    } else {
-      try {
-        const res = await fetch(JSONBLOB_BASE, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Accept": "application/json" },
-          body: JSON.stringify({ questions: DEFAULT_QUESTIONS, attempts: [] }),
-        });
-        const loc = res.headers.get("Location");
-        if (loc) {
-          const id = loc.split("/").pop();
-          state.blobId = id;
-          state.questions = DEFAULT_QUESTIONS.slice();
-          state.attempts = [];
-          state.storageMode = "shared";
+        state.syncFailed = false;
+
+        if (!getParam("db")) {
           const url = new URL(window.location.href);
-          url.searchParams.set("db", id);
+          url.searchParams.set("db", shared.id);
           window.history.replaceState({}, "", url.toString());
-        } else {
-          throw new Error("no location header");
         }
+        if (state.questions.length !== shared.questions.length) await persist();
+        return true;
       } catch (e) {
-        state.storageMode = "local";
-        loadLocal();
+        if (attempt === 1) await new Promise(r => setTimeout(r, 1200));
       }
     }
+    state.storageMode = "local";
+    loadLocal();
+    return false;
+  }
+
+  async function initStorage() {
+    await connectShared();
     renderShareBox();
     renderStatus();
   }
@@ -261,44 +278,70 @@
     localStorage.setItem("qtool_attempts", JSON.stringify(state.attempts));
   }
 
+  // локальная копия пишется всегда — это подстраховка на случай,
+  // если запрос к общему хранилищу вдруг не пройдёт
   async function persist() {
-    if (state.storageMode === "shared" && state.blobId) {
-      try {
-        await fetch(JSONBLOB_BASE + "/" + state.blobId, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ questions: state.questions, attempts: state.attempts }),
-        });
-      } catch (e) {
-      }
-    } else {
-      persistLocal();
+    persistLocal();
+    if (state.storageMode !== "shared" || !state.blobId) return;
+    try {
+      const res = await fetchWithTimeout(JSONBLOB_BASE + "/" + state.blobId, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ questions: state.questions, attempts: state.attempts }),
+      });
+      if (!res.ok) throw new Error("put failed");
+      state.syncFailed = false;
+    } catch (e) {
+      state.syncFailed = true;
     }
+    renderStatus();
   }
 
   function renderShareBox() {
-    const el = document.getElementById("shareLink");
-    const url = window.location.href;
+    const box = document.getElementById("shareBox");
     if (state.storageMode === "shared") {
-      el.textContent = url;
+      box.innerHTML = `
+        <code id="shareLink">${esc(window.location.href)}</code>
+        <button id="copyBtn">Скопировать</button>
+      `;
+      document.getElementById("copyBtn").addEventListener("click", () => {
+        navigator.clipboard.writeText(window.location.href).then(() => {
+          const b = document.getElementById("copyBtn");
+          const old = b.textContent;
+          b.textContent = "Скопировано";
+          setTimeout(() => (b.textContent = old), 1200);
+        });
+      });
     } else {
-      el.textContent = "общее хранилище недоступно — данные только в этом браузере";
+      box.innerHTML = `
+        <code id="shareLink">общее хранилище сейчас недоступно — данные сохраняются только в этом браузере</code>
+        <button id="reconnectBtn">${state.connecting ? "Подключаюсь…" : "Подключиться"}</button>
+      `;
+      const btn = document.getElementById("reconnectBtn");
+      if (state.connecting) btn.disabled = true;
+      btn.addEventListener("click", async () => {
+        state.connecting = true;
+        renderShareBox();
+        await connectShared();
+        state.connecting = false;
+        renderShareBox();
+        renderStatus();
+        render();
+      });
     }
   }
 
   function renderStatus() {
-    document.getElementById("statusText").textContent =
-      state.storageMode === "shared" ? "общее хранилище" : "локально";
+    const pill = document.getElementById("statusPill");
+    const el = document.getElementById("statusText");
+    const shared = state.storageMode === "shared";
+    pill.className = "status " + (shared && !state.syncFailed ? "status-ok" : "status-warn");
+    if (shared) {
+      el.textContent = state.syncFailed ? "общее хранилище — не синхронизировано" : "общее хранилище";
+    } else {
+      el.textContent = "локально";
+    }
   }
-
-  document.getElementById("copyBtn").addEventListener("click", () => {
-    navigator.clipboard.writeText(window.location.href).then(() => {
-      const b = document.getElementById("copyBtn");
-      const old = b.textContent;
-      b.textContent = "Скопировано";
-      setTimeout(() => (b.textContent = old), 1200);
-    });
-  });
   function renderShell() {
     const tracksEl = document.getElementById("tracks");
     tracksEl.innerHTML = Object.entries(TRACKS).map(([id, t]) =>
