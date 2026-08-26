@@ -187,7 +187,9 @@
     editingId: null,
     newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
   };
-  const JSONBLOB_BASE = "https://jsonblob.com/api/jsonBlob";
+  // jsonblob.com перестал отдавать Access-Control-Allow-Origin, из-за чего
+  // браузер блокировал запросы ещё до отправки — переехали на kvdb.io
+  const STORE_BASE = "https://kvdb.io";
   const REQUEST_TIMEOUT = 8000;
 
   function getParam(name) {
@@ -208,27 +210,28 @@
   async function fetchSharedData() {
     const idFromUrl = getParam("db");
     if (idFromUrl) {
-      const res = await fetchWithTimeout(JSONBLOB_BASE + "/" + idFromUrl);
+      const res = await fetchWithTimeout(STORE_BASE + "/" + idFromUrl + "/data");
       if (!res.ok) throw new Error("хранилище с этим id не найдено");
-      const data = await res.json();
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
       return {
         id: idFromUrl,
         questions: Array.isArray(data.questions) ? data.questions : [],
         attempts: Array.isArray(data.attempts) ? data.attempts : [],
       };
     }
-    const res = await fetchWithTimeout(JSONBLOB_BASE, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ questions: DEFAULT_QUESTIONS, attempts: [] }),
-    });
-    const location = res.headers.get("Location");
-    if (!res.ok || !location) throw new Error("сервис хранилища не ответил");
-    return { id: location.split("/").pop(), questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
+    const createRes = await fetchWithTimeout(STORE_BASE + "/", { method: "POST" });
+    const bucket = (await createRes.text()).trim();
+    if (!createRes.ok || !bucket) throw new Error("сервис хранилища не ответил");
+
+    const seed = JSON.stringify({ questions: DEFAULT_QUESTIONS, attempts: [] });
+    const seedRes = await fetchWithTimeout(STORE_BASE + "/" + bucket + "/data", { method: "POST", body: seed });
+    if (!seedRes.ok) throw new Error("не удалось записать начальные данные");
+    return { id: bucket, questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
   }
 
-  // jsonblob иногда отваливается на секунду-две, поэтому даём вторую попытку
-  // перед тем как уходить в локальный режим
+  // сервис хранилища иногда отваливается на секунду-две, поэтому даём
+  // вторую попытку перед тем как уходить в локальный режим
   async function connectShared() {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
@@ -284,9 +287,8 @@
     persistLocal();
     if (state.storageMode !== "shared" || !state.blobId) return;
     try {
-      const res = await fetchWithTimeout(JSONBLOB_BASE + "/" + state.blobId, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
+      const res = await fetchWithTimeout(STORE_BASE + "/" + state.blobId + "/data", {
+        method: "POST",
         body: JSON.stringify({ questions: state.questions, attempts: state.attempts }),
       });
       if (!res.ok) throw new Error("put failed");
