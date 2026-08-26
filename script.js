@@ -187,25 +187,47 @@
     editingId: null,
     newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
   };
-  // ни один бесплатный сервис-хранилище не бывает надёжным сам по себе
-  // (jsonblob перестал слать CORS-заголовки, kvdb.io периодически падает
-  // с 500), поэтому пробуем несколько провайдеров по очереди — первый,
-  // кто ответил, и становится хранилищем
+  // jsonblob перестал слать CORS-заголовки, kvdb.io и extendsclass.com
+  // оказались нестабильны (500-е и обрывы CORS-preflight) — переехали на
+  // jsonbin.io: платформа специально для таких клиентских приложений,
+  // с master-ключом и стабильным CORS
   const REQUEST_TIMEOUT = 8000;
+  const JSONBIN_MASTER_KEY = "$2a$10$9nGLARcNk9H49UQiej5nLOtG3pBSIcg8MkQZB4m3slOxeMl9o78Dy";
 
-  const PROVIDERS = [
-    {
-      name: "kvdb",
+  // kvdb оставлен только на чтение — по старым ссылкам, которые уже
+  // разошлись, чтобы они не сломались; новые хранилища через него не создаём
+  const PROVIDERS = {
+    jsonbin: {
       async create(seed) {
-        const createRes = await fetchWithTimeout("https://kvdb.io/", { method: "POST" });
-        const bucket = (await createRes.text()).trim();
-        if (!createRes.ok || !bucket) throw new Error("kvdb: bucket не создан");
-        const seedRes = await fetchWithTimeout("https://kvdb.io/" + bucket + "/data", {
-          method: "POST", body: JSON.stringify(seed),
+        const res = await fetchWithTimeout("https://api.jsonbin.io/v3/b", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Master-Key": JSONBIN_MASTER_KEY },
+          body: JSON.stringify(seed),
         });
-        if (!seedRes.ok) throw new Error("kvdb: не записались начальные данные");
-        return bucket;
+        if (!res.ok) throw new Error("jsonbin: bin не создан");
+        const data = await res.json();
+        if (!data.metadata || !data.metadata.id) throw new Error("jsonbin: сервис не вернул id");
+        return data.metadata.id;
       },
+      async read(id) {
+        const res = await fetchWithTimeout("https://api.jsonbin.io/v3/b/" + id + "/latest", {
+          headers: { "X-Master-Key": JSONBIN_MASTER_KEY },
+        });
+        if (!res.ok) throw new Error("jsonbin: чтение не удалось");
+        const data = await res.json();
+        return data.record || {};
+      },
+      async write(id, data) {
+        const res = await fetchWithTimeout("https://api.jsonbin.io/v3/b/" + id, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "X-Master-Key": JSONBIN_MASTER_KEY },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error("jsonbin: запись не удалась");
+      },
+    },
+    kvdb: {
+      async create() { throw new Error("kvdb: создание отключено, только чтение старых ссылок"); },
       async read(id) {
         const res = await fetchWithTimeout("https://kvdb.io/" + id + "/data");
         if (!res.ok) throw new Error("kvdb: чтение не удалось");
@@ -219,37 +241,11 @@
         if (!res.ok) throw new Error("kvdb: запись не удалась");
       },
     },
-    {
-      name: "extendsclass",
-      async create(seed) {
-        const res = await fetchWithTimeout("https://extendsclass.com/api/json-storage/bin", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(seed),
-        });
-        if (!res.ok) throw new Error("extendsclass: bucket не создан");
-        const data = await res.json();
-        if (!data.id) throw new Error("extendsclass: сервис не вернул id");
-        return data.id;
-      },
-      async read(id) {
-        const res = await fetchWithTimeout("https://extendsclass.com/api/json-storage/bin/" + id);
-        if (!res.ok) throw new Error("extendsclass: чтение не удалось");
-        return await res.json();
-      },
-      async write(id, data) {
-        const res = await fetchWithTimeout("https://extendsclass.com/api/json-storage/bin/" + id, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
-        });
-        if (!res.ok) throw new Error("extendsclass: запись не удалась");
-      },
-    },
-  ];
+  };
+  const CREATE_ORDER = ["jsonbin"];
 
   function findProvider(name) {
-    const p = PROVIDERS.find(p => p.name === name);
+    const p = PROVIDERS[name];
     if (!p) throw new Error("неизвестный провайдер хранилища: " + name);
     return p;
   }
@@ -291,10 +287,10 @@
 
     const seed = { questions: DEFAULT_QUESTIONS, attempts: [] };
     let lastErr;
-    for (const provider of PROVIDERS) {
+    for (const name of CREATE_ORDER) {
       try {
-        const id = await provider.create(seed);
-        return { id: provider.name + ":" + id, questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
+        const id = await PROVIDERS[name].create(seed);
+        return { id: name + ":" + id, questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
       } catch (e) {
         lastErr = e;
       }
@@ -359,11 +355,8 @@
     persistLocal();
     if (state.storageMode !== "shared" || !state.blobId) return;
     try {
-      const res = await fetchWithTimeout(STORE_BASE + "/" + state.blobId + "/data", {
-        method: "POST",
-        body: JSON.stringify({ questions: state.questions, attempts: state.attempts }),
-      });
-      if (!res.ok) throw new Error("put failed");
+      const parsed = parseDbParam(state.blobId);
+      await findProvider(parsed.provider).write(parsed.id, { questions: state.questions, attempts: state.attempts });
       state.syncFailed = false;
     } catch (e) {
       state.syncFailed = true;
