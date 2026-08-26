@@ -135,3 +135,503 @@
       situation: "Рассмотрим ситуацию: вы выдали наказание за 2.1, а потом вам пишут что они друзья и всегда так общались. Ваши действия?",
       answer: "Написать им что данный чат предназначен для общения всех участников Discord-сервера, и некоторым людям может быть неприятно от ихнего общения. Наказание снимать не буду." },
   ];
+  let state = {
+    track: "km-zgm",
+    tab: "bank",
+    questions: null,
+    attempts: null,
+    blobId: null,
+    storageMode: "local",
+    syncFailed: false,
+    connecting: false,
+    formOpen: false,
+    editingId: null,
+    newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
+  };
+  // jsonblob перестал слать CORS-заголовки, kvdb.io и extendsclass.com
+  // оказались нестабильны (500-е и обрывы CORS-preflight) — переехали на
+  // jsonbin.io: платформа специально для таких клиентских приложений,
+  // с master-ключом и стабильным CORS
+  const REQUEST_TIMEOUT = 8000;
+  const JSONBIN_MASTER_KEY = "$2a$10$9nGLARcNk9H49UQiej5nLOtG3pBSIcg8MkQZB4m3slOxeMl9o78Dy";
+
+  // kvdb оставлен только на чтение — по старым ссылкам, которые уже
+  // разошлись, чтобы они не сломались; новые хранилища через него не создаём
+  const PROVIDERS = {
+    jsonbin: {
+      async create(seed) {
+        const res = await fetchWithTimeout("https://api.jsonbin.io/v3/b", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Master-Key": JSONBIN_MASTER_KEY },
+          body: JSON.stringify(seed),
+        });
+        if (!res.ok) throw new Error("jsonbin: bin не создан");
+        const data = await res.json();
+        if (!data.metadata || !data.metadata.id) throw new Error("jsonbin: сервис не вернул id");
+        return data.metadata.id;
+      },
+      async read(id) {
+        const res = await fetchWithTimeout("https://api.jsonbin.io/v3/b/" + id + "/latest", {
+          headers: { "X-Master-Key": JSONBIN_MASTER_KEY },
+        });
+        if (!res.ok) throw new Error("jsonbin: чтение не удалось");
+        const data = await res.json();
+        return data.record || {};
+      },
+      async write(id, data) {
+        const res = await fetchWithTimeout("https://api.jsonbin.io/v3/b/" + id, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "X-Master-Key": JSONBIN_MASTER_KEY },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error("jsonbin: запись не удалась");
+      },
+    },
+    kvdb: {
+      async create() { throw new Error("kvdb: создание отключено, только чтение старых ссылок"); },
+      async read(id) {
+        const res = await fetchWithTimeout("https://kvdb.io/" + id + "/data");
+        if (!res.ok) throw new Error("kvdb: чтение не удалось");
+        const text = await res.text();
+        return text ? JSON.parse(text) : {};
+      },
+      async write(id, data) {
+        const res = await fetchWithTimeout("https://kvdb.io/" + id + "/data", {
+          method: "POST", body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error("kvdb: запись не удалась");
+      },
+    },
+  };
+  const CREATE_ORDER = ["jsonbin"];
+
+  function findProvider(name) {
+    const p = PROVIDERS[name];
+    if (!p) throw new Error("неизвестный провайдер хранилища: " + name);
+    return p;
+  }
+
+  // старые ссылки хранили голый id бакета kvdb без префикса — считаем их kvdb
+  function parseDbParam(raw) {
+    if (!raw) return null;
+    const idx = raw.indexOf(":");
+    if (idx === -1) return { provider: "kvdb", id: raw };
+    return { provider: raw.slice(0, idx), id: raw.slice(idx + 1) };
+  }
+
+  function getParam(name) {
+    return new URLSearchParams(window.location.search).get(name);
+  }
+  function mergeDefaults(existing) {
+    const have = new Set(existing.map(q => q.track + "::" + q.title));
+    const missing = DEFAULT_QUESTIONS.filter(q => !have.has(q.track + "::" + q.title));
+    return existing.concat(missing);
+  }
+
+  function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+  }
+
+  async function fetchSharedData() {
+    const raw = getParam("db");
+    const parsed = parseDbParam(raw);
+    if (parsed) {
+      const data = await findProvider(parsed.provider).read(parsed.id);
+      return {
+        id: parsed.provider + ":" + parsed.id,
+        questions: Array.isArray(data.questions) ? data.questions : [],
+        attempts: Array.isArray(data.attempts) ? data.attempts : [],
+      };
+    }
+
+    const seed = { questions: DEFAULT_QUESTIONS, attempts: [] };
+    let lastErr;
+    for (const name of CREATE_ORDER) {
+      try {
+        const id = await PROVIDERS[name].create(seed);
+        return { id: name + ":" + id, questions: DEFAULT_QUESTIONS.slice(), attempts: [] };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("ни один сервис хранилища не ответил");
+  }
+
+  // если выбранный провайдер недоступен, даём вторую попытку перед тем
+  // как уходить в локальный режим — за это время он мог отойти
+  async function connectShared() {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const shared = await fetchSharedData();
+        state.blobId = shared.id;
+        state.questions = mergeDefaults(shared.questions);
+        state.attempts = shared.attempts;
+        state.storageMode = "shared";
+        state.syncFailed = false;
+
+        if (!getParam("db")) {
+          const url = new URL(window.location.href);
+          url.searchParams.set("db", shared.id);
+          window.history.replaceState({}, "", url.toString());
+        }
+        if (state.questions.length !== shared.questions.length) await persist();
+        return true;
+      } catch (e) {
+        if (attempt === 1) await new Promise(r => setTimeout(r, 1200));
+      }
+    }
+    state.storageMode = "local";
+    loadLocal();
+    return false;
+  }
+
+  async function initStorage() {
+    await connectShared();
+    renderShareBox();
+    renderStatus();
+  }
+
+  function loadLocal() {
+    let loaded = [];
+    try {
+      loaded = JSON.parse(localStorage.getItem("qtool_questions") || "null") || [];
+    } catch (e) { loaded = []; }
+    state.questions = mergeDefaults(loaded);
+    try {
+      state.attempts = JSON.parse(localStorage.getItem("qtool_attempts") || "null") || [];
+    } catch (e) { state.attempts = []; }
+    persistLocal();
+  }
+
+  function persistLocal() {
+    localStorage.setItem("qtool_questions", JSON.stringify(state.questions));
+    localStorage.setItem("qtool_attempts", JSON.stringify(state.attempts));
+  }
+
+  // локальная копия пишется всегда — это подстраховка на случай,
+  // если запрос к общему хранилищу вдруг не пройдёт
+  async function persist() {
+    persistLocal();
+    if (state.storageMode !== "shared" || !state.blobId) return;
+    try {
+      const parsed = parseDbParam(state.blobId);
+      await findProvider(parsed.provider).write(parsed.id, { questions: state.questions, attempts: state.attempts });
+      state.syncFailed = false;
+    } catch (e) {
+      state.syncFailed = true;
+    }
+    renderStatus();
+  }
+
+  function renderShareBox() {
+    const box = document.getElementById("shareBox");
+    if (state.storageMode === "shared") {
+      box.innerHTML = `
+        <code id="shareLink">${esc(window.location.href)}</code>
+        <button id="copyBtn">Скопировать</button>
+      `;
+      document.getElementById("copyBtn").addEventListener("click", () => {
+        navigator.clipboard.writeText(window.location.href).then(() => {
+          const b = document.getElementById("copyBtn");
+          const old = b.textContent;
+          b.textContent = "Скопировано";
+          setTimeout(() => (b.textContent = old), 1200);
+        });
+      });
+    } else {
+      box.innerHTML = `
+        <code id="shareLink">общее хранилище сейчас недоступно — данные сохраняются только в этом браузере</code>
+        <button id="reconnectBtn">${state.connecting ? "Подключаюсь…" : "Подключиться"}</button>
+      `;
+      const btn = document.getElementById("reconnectBtn");
+      if (state.connecting) btn.disabled = true;
+      btn.addEventListener("click", async () => {
+        state.connecting = true;
+        renderShareBox();
+        await connectShared();
+        state.connecting = false;
+        renderShareBox();
+        renderStatus();
+        render();
+      });
+    }
+  }
+
+  function renderStatus() {
+    const pill = document.getElementById("statusPill");
+    const el = document.getElementById("statusText");
+    const shared = state.storageMode === "shared";
+    pill.className = "status " + (shared && !state.syncFailed ? "status-ok" : "status-warn");
+    if (shared) {
+      el.textContent = state.syncFailed ? "общее хранилище — не синхронизировано" : "общее хранилище";
+    } else {
+      el.textContent = "локально";
+    }
+  }
+  function renderShell() {
+    const tracksEl = document.getElementById("tracks");
+    tracksEl.innerHTML = Object.entries(TRACKS).map(([id, t]) =>
+      `<button class="track-btn ${state.track === id ? "active" : ""}" data-track="${id}">${esc(t.label)}</button>`
+    ).join("");
+    tracksEl.querySelectorAll("[data-track]").forEach(b =>
+      b.addEventListener("click", () => { state.track = b.dataset.track; state.tab = state.tab; render(); })
+    );
+
+    const tabsEl = document.getElementById("tabs");
+    tabsEl.innerHTML = TABS.map(t =>
+      `<button class="tab-btn ${state.tab === t.id ? "active" : ""}" data-tab="${t.id}">${esc(t.label)}</button>`
+    ).join("");
+    tabsEl.querySelectorAll("[data-tab]").forEach(b =>
+      b.addEventListener("click", () => { state.tab = b.dataset.tab; render(); })
+    );
+  }
+  function renderBank() {
+    const content = document.getElementById("content");
+    const list = state.questions.filter(q => q.track === state.track);
+    let html = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+        <div>
+          <div class="section-title">Банк вопросов — ${esc(TRACKS[state.track].label)}</div>
+          <div class="section-sub">${list.length} ${list.length === 1 ? "вопрос" : "вопросов"} в этом треке</div>
+        </div>
+        ${!state.formOpen ? `<button class="btn btn-primary" id="addBtn">+ Добавить вопрос</button>` : ""}
+      </div>
+    `;
+
+    if (state.formOpen) {
+      const editing = state.editingId ? state.questions.find(q => q.id === state.editingId) : null;
+      html += `
+        <div class="card">
+          <label class="field-label">Заголовок</label>
+          <input class="field" id="fTitle" value="${esc(editing ? editing.title : "")}" placeholder="Например: Конфликт двух модераторов" style="margin-bottom:12px;" />
+          <label class="field-label">Задание</label>
+          <textarea class="field" id="fSituation" rows="4" placeholder="Опишите ситуацию" style="margin-bottom:12px;">${esc(editing ? editing.situation : "")}</textarea>
+          <label class="field-label">Ответ</label>
+          <textarea class="field" id="fAnswer" rows="3" placeholder="Правильный ответ" style="margin-bottom:14px;">${esc(editing ? editing.answer : "")}</textarea>
+          <div style="display:flex;gap:10px;">
+            <button class="btn btn-primary" id="fSubmit">${editing ? "Сохранить изменения" : "Добавить в банк"}</button>
+            <button class="btn btn-ghost" id="fCancel">Отмена</button>
+          </div>
+        </div>
+      `;
+    }
+
+    if (list.length === 0 && !state.formOpen) {
+      html += `<div class="empty"><div class="empty-title">Пока пусто</div><div class="empty-hint">Добавьте первый вопрос — кнопка сверху.</div></div>`;
+    } else {
+      html += list.map(q => `
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;gap:12px;">
+            <div style="flex:1;min-width:0;">
+              <div class="qtitle">${esc(q.title)}</div>
+              <div class="qbody">${esc(q.situation)}</div>
+              ${q.answer ? `<div class="qanswer"><strong>Ответ:</strong> ${esc(q.answer)}</div>` : ""}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0;">
+              <button class="btn-sm" data-edit="${q.id}">Изменить</button>
+              <button class="btn-sm" data-del="${q.id}" style="color:var(--bad);">Удалить</button>
+            </div>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    content.innerHTML = html;
+
+    const addBtn = document.getElementById("addBtn");
+    if (addBtn) addBtn.addEventListener("click", () => { state.formOpen = true; state.editingId = null; render(); });
+
+    const cancel = document.getElementById("fCancel");
+    if (cancel) cancel.addEventListener("click", () => { state.formOpen = false; state.editingId = null; render(); });
+
+    const submit = document.getElementById("fSubmit");
+    if (submit) submit.addEventListener("click", async () => {
+      const title = document.getElementById("fTitle").value.trim();
+      const situation = document.getElementById("fSituation").value.trim();
+      const answer = document.getElementById("fAnswer").value.trim();
+      if (!title || !situation) return;
+      if (state.editingId) {
+        const q = state.questions.find(x => x.id === state.editingId);
+        q.title = title; q.situation = situation; q.answer = answer;
+      } else {
+        state.questions.push({ id: uid(), track: state.track, title, situation, answer, createdAt: Date.now() });
+      }
+      state.formOpen = false; state.editingId = null;
+      await persist();
+      render();
+    });
+
+    content.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => {
+      state.formOpen = true; state.editingId = b.dataset.edit; render();
+    }));
+    content.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
+      state.questions = state.questions.filter(q => q.id !== b.dataset.del);
+      await persist();
+      render();
+    }));
+  }
+  function renderNew() {
+    const content = document.getElementById("content");
+    const list = state.questions.filter(q => q.track === state.track);
+    const na = state.newAttempt;
+
+    if (list.length === 0) {
+      content.innerHTML = `<div class="empty"><div class="empty-title">В этом треке нет вопросов</div><div class="empty-hint">Сначала добавьте вопросы во вкладке «Банк вопросов».</div></div>`;
+      return;
+    }
+
+    if (na.step === "fill") {
+      content.innerHTML = `
+        <div class="section-title">Аттестация: ${esc(na.candidate)}</div>
+        <div class="section-sub">${esc(TRACKS[state.track].label)} · ${na.selected.length} вопрос(ов)</div>
+        ${na.selected.map((qid, i) => {
+          const q = list.find(x => x.id === qid);
+          if (!q) return "";
+          const verdict = na.verdicts[qid] || "pending";
+          return `
+            <div class="card log ${verdict}">
+              <div class="qtag">ВОПРОС ${i + 1}</div>
+              <div class="qtitle">${esc(q.title)}</div>
+              <div class="qbody">${esc(q.situation)}</div>
+              ${q.answer ? `<div class="qanswer"><strong>Ответ:</strong> ${esc(q.answer)}</div>` : ""}
+              <div style="display:flex;gap:8px;margin-top:12px;">
+                <button class="btn-sm ${verdict === "correct" ? "btn-verdict-good" : "btn-verdict-off"}" data-verdict="correct" data-q="${qid}">✓ Верно</button>
+                <button class="btn-sm ${verdict === "incorrect" ? "btn-verdict-bad" : "btn-verdict-off"}" data-verdict="incorrect" data-q="${qid}">✗ Неверно</button>
+              </div>
+            </div>
+          `;
+        }).join("")}
+        <div style="display:flex;gap:10px;margin-top:16px;">
+          <button class="btn btn-primary" id="saveAttempt" ${na.selected.every(qid => na.verdicts[qid]) ? "" : "disabled"}>Завершить аттестацию</button>
+          <button class="btn btn-ghost" id="backSetup">Назад</button>
+        </div>
+      `;
+      content.querySelectorAll("[data-verdict]").forEach(b => b.addEventListener("click", () => {
+        na.verdicts[b.dataset.q] = b.dataset.verdict;
+        render();
+      }));
+      document.getElementById("backSetup").addEventListener("click", () => { na.step = "setup"; render(); });
+      const saveBtn = document.getElementById("saveAttempt");
+      if (saveBtn) saveBtn.addEventListener("click", async () => {
+        if (!na.selected.every(qid => na.verdicts[qid])) return;
+        const answers = na.selected.map(qid => ({ questionId: qid, verdict: na.verdicts[qid] }));
+        const correct = answers.filter(a => a.verdict === "correct").length;
+        const attempt = {
+          id: uid(), track: state.track, candidate: na.candidate, createdAt: Date.now(),
+          status: "completed", completedAt: Date.now(),
+          score: correct, total: answers.length, answers,
+        };
+        state.attempts.unshift(attempt);
+        state.newAttempt = { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: na.randomCount || 5 };
+        await persist();
+        state.tab = "history";
+        render();
+      });
+      return;
+    }
+
+    content.innerHTML = `
+      <div class="section-title">Новая аттестация — ${esc(TRACKS[state.track].label)}</div>
+      <div class="card">
+        <label class="field-label">Кандидат</label>
+        <input class="field" id="candName" value="${esc(na.candidate)}" placeholder="Ник кандидата" style="margin-bottom:16px;" />
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+          <div class="field-label" style="margin-bottom:0;">Выберите вопросы (${na.selected.length} из ${list.length})</div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <input class="field" id="randomCount" type="number" min="1" max="${list.length}" value="${Math.min(na.randomCount || 5, list.length)}" style="width:56px;padding:6px 8px;text-align:center;" />
+            <button class="btn-sm" id="randomPick" style="white-space:nowrap;">🎲 Случайные</button>
+          </div>
+        </div>
+        <div class="checklist">
+          ${list.map(q => `
+            <label class="check-item ${na.selected.includes(q.id) ? "on" : ""}" data-check="${q.id}">
+              <input type="checkbox" ${na.selected.includes(q.id) ? "checked" : ""} />
+              <div>
+                <div class="check-title">${esc(q.title)}</div>
+                <div class="check-sub">${esc(q.situation.slice(0, 110))}${q.situation.length > 110 ? "…" : ""}</div>
+              </div>
+            </label>
+          `).join("")}
+        </div>
+        <button class="btn btn-primary" id="toAnswers" style="margin-top:16px;" ${(!na.candidate.trim() || na.selected.length === 0) ? "disabled" : ""}>Перейти к оценке →</button>
+      </div>
+    `;
+    document.getElementById("candName").addEventListener("input", (e) => {
+      na.candidate = e.target.value;
+      document.getElementById("toAnswers").disabled = !na.candidate.trim() || na.selected.length === 0;
+    });
+    document.getElementById("randomCount").addEventListener("input", (e) => {
+      na.randomCount = Math.max(1, parseInt(e.target.value, 10) || 1);
+    });
+    document.getElementById("randomPick").addEventListener("click", () => {
+      const n = Math.min(Math.max(1, na.randomCount || 5), list.length);
+      const pool = list.map(q => q.id);
+      for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+      }
+      na.selected = pool.slice(0, n);
+      render();
+    });
+    content.querySelectorAll("[data-check]").forEach(el => el.addEventListener("click", (e) => {
+      e.preventDefault();
+      const id = el.dataset.check;
+      if (na.selected.includes(id)) na.selected = na.selected.filter(x => x !== id);
+      else na.selected.push(id);
+      render();
+    }));
+    document.getElementById("toAnswers").addEventListener("click", () => {
+      if (!na.candidate.trim() || na.selected.length === 0) return;
+      na.verdicts = {};
+      na.step = "fill";
+      render();
+    });
+  }
+  function renderHistory() {
+    const content = document.getElementById("content");
+    const list = state.attempts.filter(a => a.track === state.track)
+      .sort((a, b) => (b.completedAt || b.createdAt) - (a.completedAt || a.createdAt));
+    if (list.length === 0) {
+      content.innerHTML = `<div class="empty"><div class="empty-title">Пока нет аттестаций</div><div class="empty-hint">История появится после первой созданной аттестации.</div></div>`;
+      return;
+    }
+    content.innerHTML = `
+      <div class="section-title">История — ${esc(TRACKS[state.track].label)}</div>
+      <div style="height:14px;"></div>
+      ${list.map(a => `
+        <div class="card hist-row" data-attempt-id="${esc(a.id)}" title="ПКМ, чтобы удалить">
+          <div>
+            <div class="hist-name">${esc(a.candidate)}</div>
+            <div class="hist-date">${new Date(a.createdAt).toLocaleDateString("ru-RU")}${a.status === "completed" && a.completedAt ? " · проверено " + new Date(a.completedAt).toLocaleDateString("ru-RU") : ""}</div>
+          </div>
+          <div>
+            ${a.status === "pending_review"
+              ? `<span class="badge badge-pending">на проверке</span>`
+              : `<span class="badge ${a.score === a.total ? "badge-good" : (a.score / a.total >= 0.6 ? "badge-pending" : "badge-bad")}">${a.score} / ${a.total}</span>`}
+          </div>
+        </div>
+      `).join("")}
+    `;
+    content.querySelectorAll(".hist-row").forEach(row => {
+      row.addEventListener("contextmenu", async (e) => {
+        e.preventDefault();
+        const id = row.dataset.attemptId;
+        const attempt = state.attempts.find(a => a.id === id);
+        if (!attempt) return;
+        if (!confirm(`Удалить аттестацию «${attempt.candidate}»? Это действие необратимо.`)) return;
+        state.attempts = state.attempts.filter(a => a.id !== id);
+        await persist();
+        renderHistory();
+      });
+    });
+  }
+  function render() {
+    renderShell();
+    if (state.tab === "bank") renderBank();
+    else if (state.tab === "new") renderNew();
+    else if (state.tab === "history") renderHistory();
+  }
+
+  initStorage().then(render);
