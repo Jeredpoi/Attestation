@@ -640,7 +640,7 @@
       <div class="section-title">История — ${esc(TRACKS[state.track].label)}</div>
       <div style="height:14px;"></div>
       ${list.map(a => `
-        <div class="card hist-row">
+        <div class="card hist-row" data-attempt-id="${esc(a.id)}" title="ПКМ, чтобы удалить">
           <div>
             <div class="hist-name">${esc(a.candidate)}</div>
             <div class="hist-date">${new Date(a.createdAt).toLocaleDateString("ru-RU")}${a.status === "completed" && a.completedAt ? " · проверено " + new Date(a.completedAt).toLocaleDateString("ru-RU") : ""}</div>
@@ -653,6 +653,18 @@
         </div>
       `).join("")}
     `;
+    content.querySelectorAll(".hist-row").forEach(row => {
+      row.addEventListener("contextmenu", async (e) => {
+        e.preventDefault();
+        const id = row.dataset.attemptId;
+        const attempt = state.attempts.find(a => a.id === id);
+        if (!attempt) return;
+        if (!confirm(`Удалить аттестацию «${attempt.candidate}»? Это действие необратимо.`)) return;
+        state.attempts = state.attempts.filter(a => a.id !== id);
+        await persist();
+        renderHistory();
+      });
+    });
   }
   function render() {
     renderShell();

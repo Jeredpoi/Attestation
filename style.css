@@ -161,6 +161,6 @@
   .check-title { font-weight: 600; font-size: 13.5px; }
   .check-sub { font-size: 12px; color: var(--text-faint); margin-top: 2px; }
 
-  .hist-row { display: flex; align-items: center; justify-content: space-between; }
+  .hist-row { display: flex; align-items: center; justify-content: space-between; cursor: context-menu; }
   .hist-name { font-weight: 650; font-size: 14.5px; }
   .hist-date { font-size: 12px; color: var(--text-faint); margin-top: 2px; }
