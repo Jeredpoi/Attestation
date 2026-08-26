@@ -149,15 +149,11 @@
     bankSearch: "",
     newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
   };
-  // jsonblob перестал слать CORS-заголовки, kvdb.io и extendsclass.com
-  // оказались нестабильны (500-е и обрывы CORS-preflight) — переехали на
-  // jsonbin.io: платформа специально для таких клиентских приложений,
-  // с master-ключом и стабильным CORS
+  // jsonblob и kvdb.io в итоге оказались нестабильны, переехали на jsonbin.io
   const REQUEST_TIMEOUT = 8000;
   const JSONBIN_MASTER_KEY = "$2a$10$9nGLARcNk9H49UQiej5nLOtG3pBSIcg8MkQZB4m3slOxeMl9o78Dy";
 
-  // kvdb оставлен только на чтение — по старым ссылкам, которые уже
-  // разошлись, чтобы они не сломались; новые хранилища через него не создаём
+  // kvdb только читает старые разошедшиеся ссылки, новые бакеты через него не создаём
   const PROVIDERS = {
     jsonbin: {
       async create(seed) {
@@ -260,8 +256,7 @@
     throw lastErr || new Error("ни один сервис хранилища не ответил");
   }
 
-  // если выбранный провайдер недоступен, даём вторую попытку перед тем
-  // как уходить в локальный режим — за это время он мог отойти
+  // даём провайдеру вторую попытку перед тем, как уходить в локальный режим
   async function connectShared() {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
@@ -311,8 +306,7 @@
     localStorage.setItem("qtool_attempts", JSON.stringify(state.attempts));
   }
 
-  // локальная копия пишется всегда — это подстраховка на случай,
-  // если запрос к общему хранилищу вдруг не пройдёт
+  // локальная копия пишется всегда — подстраховка на случай, если общее хранилище недоступно
   async function persist() {
     persistLocal();
     if (state.storageMode !== "shared" || !state.blobId) return;
