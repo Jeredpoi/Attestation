@@ -146,6 +146,7 @@
     connecting: false,
     formOpen: false,
     editingId: null,
+    bankSearch: "",
     newAttempt: { step: "setup", candidate: "", selected: [], verdicts: {}, randomCount: 5 },
   };
   // jsonblob перестал слать CORS-заголовки, kvdb.io и extendsclass.com
@@ -389,15 +390,28 @@
   }
   function renderBank() {
     const content = document.getElementById("content");
-    const list = state.questions.filter(q => q.track === state.track);
+    const trackList = state.questions.filter(q => q.track === state.track);
+    const term = state.bankSearch.trim().toLowerCase();
+    const list = term
+      ? trackList.filter(q =>
+          q.title.toLowerCase().includes(term) ||
+          q.situation.toLowerCase().includes(term) ||
+          (q.answer || "").toLowerCase().includes(term))
+      : trackList;
     let html = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap;">
         <div>
           <div class="section-title">Банк вопросов — ${esc(TRACKS[state.track].label)}</div>
-          <div class="section-sub">${list.length} ${list.length === 1 ? "вопрос" : "вопросов"} в этом треке</div>
+          <div class="section-sub">${list.length} ${list.length === 1 ? "вопрос" : "вопросов"}${term ? ` из ${trackList.length}` : ""} в этом треке</div>
         </div>
-        ${!state.formOpen ? `<button class="btn btn-primary" id="addBtn">+ Добавить вопрос</button>` : ""}
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-ghost" id="exportBtn">Экспорт</button>
+          <button class="btn btn-ghost" id="importBtn">Импорт</button>
+          <input type="file" id="importFile" accept="application/json" style="display:none;" />
+          ${!state.formOpen ? `<button class="btn btn-primary" id="addBtn">+ Добавить вопрос</button>` : ""}
+        </div>
       </div>
+      <input class="field" id="bankSearch" placeholder="Поиск по вопросам и ответам…" value="${esc(state.bankSearch)}" style="margin-bottom:16px;" />
     `;
 
     if (state.formOpen) {
@@ -419,7 +433,9 @@
     }
 
     if (list.length === 0 && !state.formOpen) {
-      html += `<div class="empty"><div class="empty-title">Пока пусто</div><div class="empty-hint">Добавьте первый вопрос — кнопка сверху.</div></div>`;
+      html += term
+        ? `<div class="empty"><div class="empty-title">Ничего не нашлось</div><div class="empty-hint">Попробуйте другой запрос.</div></div>`
+        : `<div class="empty"><div class="empty-title">Пока пусто</div><div class="empty-hint">Добавьте первый вопрос — кнопка сверху.</div></div>`;
     } else {
       html += list.map(q => `
         <div class="card">
@@ -439,6 +455,51 @@
     }
 
     content.innerHTML = html;
+
+    const searchInput = document.getElementById("bankSearch");
+    searchInput.addEventListener("input", () => {
+      state.bankSearch = searchInput.value;
+      const pos = searchInput.selectionStart;
+      renderBank();
+      const el = document.getElementById("bankSearch");
+      el.focus();
+      el.setSelectionRange(pos, pos);
+    });
+
+    document.getElementById("exportBtn").addEventListener("click", () => {
+      const payload = { questions: state.questions, attempts: state.attempts, exportedAt: new Date().toISOString() };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `attestation-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    const importFile = document.getElementById("importFile");
+    document.getElementById("importBtn").addEventListener("click", () => importFile.click());
+    importFile.addEventListener("change", async () => {
+      const file = importFile.files[0];
+      if (!file) return;
+      try {
+        const data = JSON.parse(await file.text());
+        const importedQuestions = Array.isArray(data.questions) ? data.questions : [];
+        const importedAttempts = Array.isArray(data.attempts) ? data.attempts : [];
+        if (!importedQuestions.length && !importedAttempts.length) throw new Error("empty");
+        if (!confirm(`Импортировать ${importedQuestions.length} вопросов и ${importedAttempts.length} попыток? Они добавятся к текущим (дубликаты по id пропускаются).`)) return;
+        const existingQIds = new Set(state.questions.map(q => q.id));
+        importedQuestions.forEach(q => { if (q.id && !existingQIds.has(q.id)) { state.questions.push(q); existingQIds.add(q.id); } });
+        const existingAIds = new Set(state.attempts.map(a => a.id));
+        importedAttempts.forEach(a => { if (a.id && !existingAIds.has(a.id)) { state.attempts.push(a); existingAIds.add(a.id); } });
+        await persist();
+        render();
+      } catch (e) {
+        alert("Не удалось прочитать файл — убедитесь, что это экспорт из этого приложения.");
+      } finally {
+        importFile.value = "";
+      }
+    });
 
     const addBtn = document.getElementById("addBtn");
     if (addBtn) addBtn.addEventListener("click", () => { state.formOpen = true; state.editingId = null; render(); });
@@ -597,8 +658,41 @@
       content.innerHTML = `<div class="empty"><div class="empty-title">Пока нет аттестаций</div><div class="empty-hint">История появится после первой созданной аттестации.</div></div>`;
       return;
     }
+
+    const graded = list.filter(a => a.status !== "pending_review" && a.total > 0);
+    const avgPct = graded.length ? Math.round(graded.reduce((sum, a) => sum + a.score / a.total, 0) / graded.length * 100) : 0;
+    const passed = graded.filter(a => a.score / a.total >= 0.6).length;
+    const passRate = graded.length ? Math.round(passed / graded.length * 100) : 0;
+    const byCandidate = {};
+    list.forEach(a => {
+      if (!byCandidate[a.candidate]) byCandidate[a.candidate] = { count: 0, sumPct: 0, graded: 0 };
+      byCandidate[a.candidate].count++;
+      if (a.status !== "pending_review" && a.total > 0) { byCandidate[a.candidate].sumPct += a.score / a.total; byCandidate[a.candidate].graded++; }
+    });
+    const topCandidates = Object.entries(byCandidate)
+      .map(([name, s]) => ({ name, count: s.count, avgPct: s.graded ? Math.round(s.sumPct / s.graded * 100) : null }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+
     content.innerHTML = `
       <div class="section-title">История — ${esc(TRACKS[state.track].label)}</div>
+      <div style="height:14px;"></div>
+      <div class="stats-row">
+        <div class="stat-tile"><div class="stat-value">${list.length}</div><div class="stat-label">аттестаций</div></div>
+        <div class="stat-tile"><div class="stat-value">${avgPct}%</div><div class="stat-label">средний балл</div></div>
+        <div class="stat-tile"><div class="stat-value">${passRate}%</div><div class="stat-label">сдали (≥60%)</div></div>
+      </div>
+      ${topCandidates.length > 1 ? `
+        <div class="section-sub" style="margin-top:16px;margin-bottom:8px;">По кандидатам</div>
+        <div class="card" style="padding:6px 20px;">
+          ${topCandidates.map(c => `
+            <div class="hist-row" style="padding:8px 0;">
+              <div class="hist-name" style="font-size:13.5px;">${esc(c.name)}</div>
+              <div class="section-sub" style="margin:0;">${c.count} ${c.count === 1 ? "попытка" : "попыток"}${c.avgPct !== null ? ` · ${c.avgPct}%` : ""}</div>
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
       <div style="height:14px;"></div>
       ${list.map(a => `
         <div class="card hist-row" data-attempt-id="${esc(a.id)}" title="ПКМ, чтобы удалить">
